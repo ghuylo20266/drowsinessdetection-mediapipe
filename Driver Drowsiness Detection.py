@@ -1,228 +1,192 @@
 #!/usr/bin/env python
-from scipy.spatial import distance as dist
-from imutils.video import VideoStream
-from imutils import face_utils
-import argparse
-import imutils
-import time
-import dlib
-import math
-from cv2 import cv2
+import cv2
+import mediapipe as mp
 import numpy as np
-from EAR import eye_aspect_ratio
-from MAR import mouth_aspect_ratio
-from HeadPose import getHeadTiltAndCoords
+import time
 
-# initialize dlib's face detector (HOG-based) and then create the
-# facial landmark predictor
-print("[INFO] loading facial landmark predictor...")
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(
-    './dlib_shape_predictor/shape_predictor_68_face_landmarks.dat')
+# Khởi tạo bộ giải pháp lưới khuôn mặt thế hệ mới của Google
+print("[INFO] Đang khởi tạo mô hình lõi Google MediaPipe Face Mesh...")
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True,  # Bật quét chi tiết mắt siêu độ phân giải
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
-# initialize the video stream and sleep for a bit, allowing the
-# camera sensor to warm up
-print("[INFO] initializing camera...")
-
-vs = VideoStream(src=1).start()
-# vs = VideoStream(usePiCamera=True).start() # Raspberry Pi
+# Mở luồng Video từ Webcam
+print("[INFO] Đang kích hoạt camera cảm biến...")
+cap = cv2.VideoCapture(0)
 time.sleep(2.0)
 
-# 400x225 to 1024x576
+# Cấu hình kích thước khung hình chuẩn tương đương file gốc
 frame_width = 1024
 frame_height = 576
 
-# loop over the frames from the video stream
-# 2D image points. If you change the image, you need to change vector
-image_points = np.array([
-    (359, 391),     # Nose tip 34
-    (399, 561),     # Chin 9
-    (337, 297),     # Left eye left corner 37
-    (513, 301),     # Right eye right corne 46
-    (345, 465),     # Left Mouth corner 49
-    (453, 469)      # Right mouth corner 55
+# =========================================================================
+# ĐỊNH NGHĨA CÁC CHỈ SỐ ĐIỂM (INDICES) CHUẨN GOOGLE MEDIAPIPE
+# =========================================================================
+# Thứ tự 6 điểm vùng mắt phục vụ công thức EAR
+RIGHT_EYE_INDICES = 
+LEFT_EYE_INDICES  = 
+
+# Thứ tự các điểm bờ môi trong phục vụ công thức MAR
+MOUTH_INDICES = 
+
+# 6 Điểm mấu chốt để định hình mô hình không gian 2D (Tương ứng 6 điểm dlib cũ)
+# Thứ tự nghiêm ngặt: [Chóp mũi, Cằm, Khóe mắt trái, Khóe mắt phải, Khóe miệng trái, Khóe miệng phải]
+HEAD_POSE_INDICES = 
+
+# Các hằng số tọa độ mô hình 3D chuẩn thế giới (World 3D Model Points)
+model_points = np.array([
+    (0.0, 0.0, 0.0),             # Chóp mũi (Nose tip)
+    (0.0, -330.0, -65.0),        # Cằm (Chin)
+    (-225.0, 170.0, -135.0),     # Góc ngoài mắt trái (Left eye corner)
+    (225.0, 170.0, -135.0),      # Góc ngoài mắt phải (Right eye corner)
+    (-150.0, -150.0, -125.0),    # Khóe miệng trái (Left Mouth corner)
+    (150.0, -150.0, -125.0)      # Khóe miệng phải (Right mouth corner)
 ], dtype="double")
 
-(lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
-(rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
-
+# Cấu hình các ngưỡng kiểm soát động hành vi tương tự file gốc
 EYE_AR_THRESH = 0.25
 MOUTH_AR_THRESH = 0.79
 EYE_AR_CONSEC_FRAMES = 3
 COUNTER = 0
 
-# grab the indexes of the facial landmarks for the mouth
-(mStart, mEnd) = (49, 68)
+def calculate_ear(landmarks, eye_indices, w, h):
+    """Tính toán Tỷ lệ khép mắt (Eye Aspect Ratio) theo khoảng cách Euclid"""
+    pts = [np.array([landmarks[idx].x * w, landmarks[idx].y * h]) for idx in eye_indices]
+    p2_p6 = np.linalg.norm(pts - pts)
+    p3_p5 = np.linalg.norm(pts - pts)
+    p1_p4 = np.linalg.norm(pts - pts)
+    ear = (p2_p6 + p3_p5) / (2.0 * p1_p4)
+    return ear, pts
 
-while True:
-    # grab the frame from the threaded video stream, resize it to
-    # have a maximum width of 400 pixels, and convert it to
-    # grayscale
-    frame = vs.read()
-    frame = imutils.resize(frame, width=1024, height=576)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    size = gray.shape
+def calculate_mar(landmarks, mouth_indices, w, h):
+    """Tính toán Tỷ lệ mở miệng (Mouth Aspect Ratio) để xác định trạng thái ngáp"""
+    pts = [np.array([landmarks[idx].x * w, landmarks[idx].y * h]) for idx in mouth_indices]
+    v1 = np.linalg.norm(pts - pts)
+    v2 = np.linalg.norm(pts - pts)
+    h_dist = np.linalg.norm(pts - pts)
+    mar = (v1 + v2) / (2.0 * h_dist)
+    return mar, pts
 
-    # detect faces in the grayscale frame
-    rects = detector(gray, 0)
-
-    # check to see if a face was detected, and if so, draw the total
-    # number of faces on the frame
-    if len(rects) > 0:
-        text = "{} face(s) found".format(len(rects))
-        cv2.putText(frame, text, (10, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-    # loop over the face detections
-    for rect in rects:
-        # compute the bounding box of the face and draw it on the
-        # frame
-        (bX, bY, bW, bH) = face_utils.rect_to_bb(rect)
-        cv2.rectangle(frame, (bX, bY), (bX + bW, bY + bH), (0, 255, 0), 1)
-        # determine the facial landmarks for the face region, then
-        # convert the facial landmark (x, y)-coordinates to a NumPy
-        # array
-        shape = predictor(gray, rect)
-        shape = face_utils.shape_to_np(shape)
-
-        # extract the left and right eye coordinates, then use the
-        # coordinates to compute the eye aspect ratio for both eyes
-        leftEye = shape[lStart:lEnd]
-        rightEye = shape[rStart:rEnd]
-        leftEAR = eye_aspect_ratio(leftEye)
-        rightEAR = eye_aspect_ratio(rightEye)
-        # average the eye aspect ratio together for both eyes
-        ear = (leftEAR + rightEAR) / 2.0
-
-        # compute the convex hull for the left and right eye, then
-        # visualize each of the eyes
-        leftEyeHull = cv2.convexHull(leftEye)
-        rightEyeHull = cv2.convexHull(rightEye)
-        cv2.drawContours(frame, [leftEyeHull], -1, (0, 255, 0), 1)
-        cv2.drawContours(frame, [rightEyeHull], -1, (0, 255, 0), 1)
-
-        # check to see if the eye aspect ratio is below the blink
-        # threshold, and if so, increment the blink frame counter
-        if ear < EYE_AR_THRESH:
-            COUNTER += 1
-            # if the eyes were closed for a sufficient number of times
-            # then show the warning
-            if COUNTER >= EYE_AR_CONSEC_FRAMES:
-                cv2.putText(frame, "Eyes Closed!", (500, 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            # otherwise, the eye aspect ratio is not below the blink
-            # threshold, so reset the counter and alarm
-        else:
-            COUNTER = 0
-
-        mouth = shape[mStart:mEnd]
-
-        mouthMAR = mouth_aspect_ratio(mouth)
-        mar = mouthMAR
-        # compute the convex hull for the mouth, then
-        # visualize the mouth
-        mouthHull = cv2.convexHull(mouth)
-
-        cv2.drawContours(frame, [mouthHull], -1, (0, 255, 0), 1)
-        cv2.putText(frame, "MAR: {:.2f}".format(mar), (650, 20), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-        # Draw text if mouth is open
-        if mar > MOUTH_AR_THRESH:
-            cv2.putText(frame, "Yawning!", (800, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-
-        # loop over the (x, y)-coordinates for the facial landmarks
-        # and draw each of them
-        for (i, (x, y)) in enumerate(shape):
-            if i == 33:
-                # something to our key landmarks
-                # save to our new key point list
-                # i.e. keypoints = [(i,(x,y))]
-                image_points[0] = np.array([x, y], dtype='double')
-                # write on frame in Green
-                cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
-                cv2.putText(frame, str(i + 1), (x - 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-            elif i == 8:
-                # something to our key landmarks
-                # save to our new key point list
-                # i.e. keypoints = [(i,(x,y))]
-                image_points[1] = np.array([x, y], dtype='double')
-                # write on frame in Green
-                cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
-                cv2.putText(frame, str(i + 1), (x - 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-            elif i == 36:
-                # something to our key landmarks
-                # save to our new key point list
-                # i.e. keypoints = [(i,(x,y))]
-                image_points[2] = np.array([x, y], dtype='double')
-                # write on frame in Green
-                cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
-                cv2.putText(frame, str(i + 1), (x - 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-            elif i == 45:
-                # something to our key landmarks
-                # save to our new key point list
-                # i.e. keypoints = [(i,(x,y))]
-                image_points[3] = np.array([x, y], dtype='double')
-                # write on frame in Green
-                cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
-                cv2.putText(frame, str(i + 1), (x - 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-            elif i == 48:
-                # something to our key landmarks
-                # save to our new key point list
-                # i.e. keypoints = [(i,(x,y))]
-                image_points[4] = np.array([x, y], dtype='double')
-                # write on frame in Green
-                cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
-                cv2.putText(frame, str(i + 1), (x - 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-            elif i == 54:
-                # something to our key landmarks
-                # save to our new key point list
-                # i.e. keypoints = [(i,(x,y))]
-                image_points[5] = np.array([x, y], dtype='double')
-                # write on frame in Green
-                cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
-                cv2.putText(frame, str(i + 1), (x - 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-            else:
-                # everything to all other landmarks
-                # write on frame in Red
-                cv2.circle(frame, (x, y), 1, (0, 0, 255), -1)
-                cv2.putText(frame, str(i + 1), (x - 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
-
-        #Draw the determinant image points onto the person's face
-        for p in image_points:
-            cv2.circle(frame, (int(p[0]), int(p[1])), 3, (0, 0, 255), -1)
-
-        (head_tilt_degree, start_point, end_point, 
-            end_point_alt) = getHeadTiltAndCoords(size, image_points, frame_height)
-
-        cv2.line(frame, start_point, end_point, (255, 0, 0), 2)
-        cv2.line(frame, start_point, end_point_alt, (0, 0, 255), 2)
-
-        if head_tilt_degree:
-            cv2.putText(frame, 'Head Tilt Degree: ' + str(head_tilt_degree[0]), (170, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        # extract the mouth coordinates, then use the
-        # coordinates to compute the mouth aspect ratio
-    # show the frameq
-    cv2.imshow("Frame", frame)
-    key = cv2.waitKey(1) & 0xFF
-
-    # if the `q` key was pressed, break from the loop
-    if key == ord("q"):
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success:
         break
 
-# print(image_points)
+    # Chuẩn hóa kích thước khung hình và chuyển màu sang RGB
+    frame = cv2.resize(frame, (frame_width, frame_height))
+    h, w, _ = frame.shape
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    # Đẩy dữ liệu qua mạng nơ-ron MediaPipe xử lý
+    results = face_mesh.process(rgb_frame)
 
-# do a bit of cleanup
+    if results.multi_face_landmarks:
+        # Hiển thị số lượng khuôn mặt tìm thấy
+        text = f"{len(results.multi_face_landmarks)} face(s) found"
+        cv2.putText(frame, text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        for face_landmarks in results.multi_face_landmarks:
+            landmarks = face_landmarks.landmark
+
+            # -----------------------------------------------------------------
+            # 1. KIỂM TRA TRẠNG THÁI MẮT (EAR) - BÁO ĐỘNG NGỦ GẬT
+            # -----------------------------------------------------------------
+            leftEAR, left_pts = calculate_ear(landmarks, LEFT_EYE_INDICES, w, h)
+            rightEAR, right_pts = calculate_ear(landmarks, RIGHT_EYE_INDICES, w, h)
+            ear = (leftEAR + rightEAR) / 2.0
+
+            # Vẽ đường bao mắt dạng đa giác (Thay thế cho ConvexHull dlib)
+            cv2.polylines(frame, [np.array(left_pts, dtype=np.int32)], True, (0, 255, 0), 1)
+            cv2.polylines(frame, [np.array(right_pts, dtype=np.int32)], True, (0, 255, 0), 1)
+
+            if ear < EYE_AR_THRESH:
+                COUNTER += 1
+                if COUNTER >= EYE_AR_CONSEC_FRAMES:
+                    cv2.putText(frame, "Eyes Closed!", (500, 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            else:
+                COUNTER = 0
+
+            # -----------------------------------------------------------------
+            # 2. KIỂM TRA TRẠNG THÁI MIỆNG (MAR) - BÁO ĐỘNG NGÁP
+            # -----------------------------------------------------------------
+            mar, mouth_pts = calculate_mar(landmarks, MOUTH_INDICES, w, h)
+            cv2.polylines(frame, [np.array(mouth_pts, dtype=np.int32)], True, (0, 255, 0), 1)
+            cv2.putText(frame, f"MAR: {mar:.2f}", (650, 20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            if mar > MOUTH_AR_THRESH:
+                cv2.putText(frame, "Yawning!", (800, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # -----------------------------------------------------------------
+            # 3. TRÍCH XUẤT ĐIỂM 2D & ƯỚC LƯỢNG GÓC ĐẦU (HEAD POSE - SOLVEPNP)
+            # -----------------------------------------------------------------
+            image_points = np.array([[landmarks[idx].x * w, landmarks[idx].y * h] for idx in HEAD_POSE_INDICES], dtype="double")
+            
+            # Khởi tạo thông số nội tại camera (Camera Matrix) giả định
+            focal_length = w
+            center = (w / 2, h / 2)
+            camera_matrix = np.array([[focal_length, 0, center], [0, focal_length, center]], dtype="double")
+            dist_coeffs = np.zeros((4, 1))  # Giả định thấu kính không biến dạng
+
+            # Giải bài toán PnP toán học biến đổi không gian hình học
+            success_pnp, rotation_vector, translation_vector = cv2.solvePnP(
+                model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+            )
+
+            # Vẽ và đánh số ID cho 6 điểm mấu chốt cấu hình không gian giống file gốc
+            for key_idx, idx in enumerate(HEAD_POSE_INDICES):
+                cx, cy = int(landmarks[idx].x * w), int(landmarks[idx].y * h)
+                cv2.circle(frame, (cx, cy), 1, (0, 255, 0), -1)
+                cv2.putText(frame, str(key_idx + 1), (cx - 10, cy - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+
+            # Vẽ các chấm đỏ đại diện cho các mốc điểm hình học chính xác lên mặt tài xế
+            for p in image_points:
+                cv2.circle(frame, (int(p[0]), int(p[1])), 3, (0, 0, 255), -1)
+
+            # -----------------------------------------------------------------
+            # 4. TÍNH TOÁN VÀ VẼ ĐƯỜNG ĐỊNH HƯỚNG KHÔNG GIAN (HEAD TILT VECTOR)
+            # -----------------------------------------------------------------
+            # Chiếu điểm 3D từ mũi ra không gian ngoài để tạo các trục Vector chiếu
+            (nose_end_point2D, _) = cv2.projectPoints(np.array([(0.0, 0.0, 1000.0)]), rotation_vector, translation_vector, camera_matrix, dist_coeffs)
+            (nose_end_point2D_alt, _) = cv2.projectPoints(np.array([(0.0, 1000.0, 0.0)]), rotation_vector, translation_vector, camera_matrix, dist_coeffs)
+
+            # Xác định các điểm đầu và điểm cuối trên ma trận hiển thị phẳng 2D
+            p1 = (int(image_points[0][0]), int(image_points[0][1])) # Gốc mũi
+            p2 = (int(nose_end_point2D[0][0][0]), int(nose_end_point2D[0][0][1])) # Trục đâm thẳng hướng nhìn
+            p3 = (int(nose_end_point2D_alt[0][0][0]), int(nose_end_point2D_alt[0][0][1])) # Trục đứng vuông góc
+
+            # Vẽ các đường thẳng mô phỏng hướng góc nghiêng không gian
+            cv2.line(frame, p1, p2, (255, 0, 0), 2)  # Đường màu xanh dương hướng nhìn
+            cv2.line(frame, p1, p3, (0, 0, 255), 2)  # Đường màu đỏ hướng trục đầu
+
+            # Tính toán góc cúi/ngửa gật đầu (Pitch Angle) dựa trên ma trận xoay Rodrigues
+            rmat, _ = cv2.Rodrigues(rotation_vector)
+            angles, _, _, _, _, _ = cv2.RQDecomp3x3(rmat)
+            head_tilt_degree = angles
+
+            # Đưa thông số góc nghiêng đầu thời gian thực lên màn hình cho Ban Giám Khảo xem
+            cv2.putText(frame, f"Head Tilt Degree: {head_tilt_degree:.2f}", (170, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # -----------------------------------------------------------------
+            # 5. HIỂN THỊ MẠNG LƯỚI ĐIỂM PHỤ TRÌNH DIỄN (VISUAL EFFECTS)
+            # -----------------------------------------------------------------
+            # Vẽ các điểm lưới liti màu đỏ khác để tăng độ ấn tượng mặt trực quan
+            for i, lm in enumerate(landmarks):
+                if i not in HEAD_POSE_INDICES and i % 7 == 0:
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    cv2.circle(frame, (cx, cy), 1, (0, 0, 255), -1)
+
+    cv2.imshow("AI Anti-Sleep - MediaPipe 2026", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
 cv2.destroyAllWindows()
-vs.stop()
