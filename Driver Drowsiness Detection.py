@@ -14,6 +14,7 @@ import time
 import unicodedata
 import urllib.request
 import wave
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -46,13 +47,18 @@ options = vision.FaceLandmarkerOptions(
 )
 landmarker = vision.FaceLandmarker.create_from_options(options)
 start_time = time.time()
+fps, fps_t, fps_n = 0.0, time.time(), 0
 
 print("[INFO] Dang mo camera...")
-cap = cv2.VideoCapture(0)
+# Windows: backend DirectShow + MJPG thường cho FPS cao hơn mặc định (MSMF)
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+cap.set(cv2.CAP_PROP_FPS, 30)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # giảm độ trễ hình
 if not cap.isOpened():  # FIX: kiểm tra camera mở được hay không
     raise SystemExit("[LOI] Khong mo duoc camera. Kiem tra lai thiet bi / quyen truy cap.")
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 time.sleep(1.0)
 
 # ---------------------------------------------------------------------------
@@ -76,8 +82,11 @@ model_points = np.array([
 # ---------------------------------------------------------------------------
 # NGƯỠNG (FIX: dùng THỜI GIAN thay vì số frame để không phụ thuộc FPS)
 # ---------------------------------------------------------------------------
-EYE_AR_THRESH = 0.25        # ...VÀ EAR phải < ngưỡng này (kết hợp 2 chỉ số để bớt báo nhầm khi nghiêng đầu)
-EYE_BLINK_THRESH = 0.45     # eyeBlink trung bình phải > ngưỡng này...
+EYE_BLINK_STRONG = 0.55     # Blink cao -> chắc chắn nhắm, bất kể góc đầu
+EYE_BLINK_WEAK = 0.35       # Blink vừa -> chỉ tính là nhắm nếu EAR cũng tụt so với lúc mở
+EYE_REL_WEAK = 0.75         # EAR / EAR_lúc_mở < 0.75
+EYE_REL_NOBLINK = 0.65      # dự phòng khi không có blendshape
+BASELINE_SECONDS = 5.0      # EAR "lúc mở mắt" lấy từ 5s gần nhất (tự thích nghi theo góc đầu)
 EYE_CLOSED_SECONDS = 0.8    # nhắm mắt quá 1s mới báo (chớp mắt bình thường ~0.1-0.4s)
 MOUTH_AR_THRESH = 0.60      # FIX: 0.79 quá cao với MAR môi trong, gần như không bao giờ kích hoạt
 YAWN_SECONDS = 1.0
@@ -86,11 +95,13 @@ HEAD_NOD_SECONDS = 1.5
 
 
 def calculate_ear(landmarks, eye_indices, w, h):
-    pts = [np.array([landmarks[i].x * w, landmarks[i].y * h]) for i in eye_indices]
-    v1 = np.linalg.norm(pts[1] - pts[5])
-    v2 = np.linalg.norm(pts[2] - pts[4])
-    hd = np.linalg.norm(pts[0] - pts[3])
-    return (v1 + v2) / (2.0 * hd + 1e-6), pts   # FIX: tránh chia cho 0
+    """EAR tính trong không gian 3D (có z) để đỡ bị méo khi quay/nghiêng đầu."""
+    p3 = [np.array([landmarks[i].x * w, landmarks[i].y * h, landmarks[i].z * w]) for i in eye_indices]
+    v1 = np.linalg.norm(p3[1] - p3[5])
+    v2 = np.linalg.norm(p3[2] - p3[4])
+    hd = np.linalg.norm(p3[0] - p3[3])
+    pts2d = [p[:2] for p in p3]                      # dùng để vẽ
+    return (v1 + v2) / (2.0 * hd + 1e-6), pts2d
 
 
 def calculate_mar(landmarks, mouth_indices, w, h):
@@ -248,6 +259,7 @@ def render_texts(img, items):
 
 
 eye_start = None
+ear_hist = deque()
 eye_open_since = None
 no_face_since = None
 yawn_start = None
@@ -296,7 +308,25 @@ try:
                 blink = (scores.get("eyeBlinkLeft", 0.0) + scores.get("eyeBlinkRight", 0.0)) / 2.0
                 cv2.putText(D, f"Blink: {blink:.2f}", (150, 45),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            eyes_closed = (blink > EYE_BLINK_THRESH and ear < EYE_AR_THRESH) if blink is not None else (ear < EYE_AR_THRESH)
+            # EAR "lúc mở mắt" của chính tư thế hiện tại: phân vị 80 của 5s gần nhất
+            tnow = time.time()
+            vals = [e for _, e in ear_hist]
+            baseline = float(np.percentile(vals, 80)) if len(vals) >= 15 else 0.30
+            baseline = max(baseline, 0.15)
+            rel = ear / baseline
+            dtext(f"Rel: {rel:.2f}", 480, 45)
+
+            if blink is not None:
+                eyes_closed = (blink > EYE_BLINK_STRONG) or \
+                              (blink > EYE_BLINK_WEAK and rel < EYE_REL_WEAK)
+            else:
+                eyes_closed = rel < EYE_REL_NOBLINK
+
+            # chỉ học baseline khi mắt đang mở, để lúc nhắm lâu không kéo baseline xuống
+            if not eyes_closed and eye_start is None:
+                ear_hist.append((tnow, ear))
+            while ear_hist and tnow - ear_hist[0][0] > BASELINE_SECONDS:
+                ear_hist.popleft()
 
             now = time.time()
             if eyes_closed:
@@ -381,7 +411,7 @@ try:
                     nod_start = None
 
             # ---------------- 4. LƯỚI ĐIỂM TRANG TRÍ ----------------
-            for i, lm in enumerate(landmarks):
+            for i, lm in (enumerate(landmarks) if DEBUG else ()):
                 if i not in HEAD_POSE_INDICES and i % 7 == 0:
                     cv2.circle(D, (int(lm.x * w), int(lm.y * h)), 1, (0, 0, 255), -1)
         else:
@@ -398,6 +428,11 @@ try:
                 eye_start = None
             dtext("Không thấy khuôn mặt", 10, 20, (255, 165, 0))
 
+        fps_n += 1
+        if time.time() - fps_t >= 1.0:
+            fps, fps_t, fps_n = fps_n / (time.time() - fps_t), time.time(), 0
+        if DEBUG:
+            dtext(f"FPS: {fps:.0f}", 10, 200)
         out = D if DEBUG else frame
         render_texts(out, pending_D if DEBUG else pending_frame)
         pending_frame.clear()
