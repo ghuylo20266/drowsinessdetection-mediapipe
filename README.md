@@ -34,7 +34,7 @@ python Driver\ Drowsiness\ Detection.py
   
 👤 **Me** (Fork & Upgrade Author)
 * Role: Upgraded the legacy system backend architecture from Dlib to Google MediaPipe Face Mesh for better edge device efficiency.
-* Github: [@ghuylo20266](https://github.com/@ghuylo20266)
+* Github: [@ghuylo20266]((https://github.com/ghuylo20266)
 
 ## Show your support
 
