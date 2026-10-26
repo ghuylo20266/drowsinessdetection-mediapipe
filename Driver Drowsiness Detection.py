@@ -90,8 +90,10 @@ BASELINE_SECONDS = 5.0      # EAR "lúc mở mắt" lấy từ 5s gần nhất (
 EYE_CLOSED_SECONDS = 0.8    # nhắm mắt quá 1s mới báo (chớp mắt bình thường ~0.1-0.4s)
 MOUTH_AR_THRESH = 0.60      # FIX: 0.79 quá cao với MAR môi trong, gần như không bao giờ kích hoạt
 YAWN_SECONDS = 1.0
-HEAD_NOD_THRESH = 20.0      # độ lệch pitch (độ) coi là gục/ngửa đầu
-HEAD_NOD_SECONDS = 1.5
+HEAD_NOD_DEG = 15.0         # pitch lệch so với tư thế bình thường của bạn (độ)
+HEAD_NOD_RATIO = 0.15       # hoặc tỉ lệ vị trí mũi trên mặt lệch quá mức này
+HEAD_NOD_SECONDS = 1.0
+HEAD_BASELINE_SECONDS = 10.0  # tư thế "bình thường" lấy từ 10s gần nhất
 
 
 def calculate_ear(landmarks, eye_indices, w, h):
@@ -264,6 +266,7 @@ eye_open_since = None
 no_face_since = None
 yawn_start = None
 nod_start = None
+nod_hist = deque()
 
 
 def duration(start):
@@ -343,7 +346,7 @@ try:
             closed_for = duration(eye_start)
             dtext(f"Nhắm mắt: {closed_for:.1f}s", 330, 45)
             if closed_for >= EYE_CLOSED_SECONDS:
-                alert("BUỒN NGỦ: Đang nhắm mắt!", 80)
+                alert("BUỒN NGỦ: Đang nhắm mắt! - Closing eyes!", 80)
 
             # ---------------- 2. MIỆNG (MAR) ----------------
             mar, mouth_pts = calculate_mar(landmarks, MOUTH_INDICES, w, h)
@@ -355,7 +358,7 @@ try:
                 if yawn_start is None:
                     yawn_start = time.time()
                 if duration(yawn_start) >= YAWN_SECONDS:
-                    alert("Đang ngáp!", 110)
+                    alert("Đang ngáp! - Yawning!", 110)
             else:
                 yawn_start = None
 
@@ -399,16 +402,34 @@ try:
                 angles = cv2.RQDecomp3x3(rmat)[0]
                 head_tilt_degree = normalize_pitch(angles[0])
 
-                dtext(f"Góc đầu: {head_tilt_degree:.1f}", 10, 135)
+                # Tỉ lệ vị trí mũi giữa đường mắt và cằm (không phụ thuộc quy ước góc)
+                eye_mid_y = (landmarks[33].y + landmarks[263].y) / 2.0
+                face_h = landmarks[152].y - eye_mid_y
+                nose_ratio = (landmarks[1].y - eye_mid_y) / (face_h + 1e-6)
 
-                # FIX: trước đây góc đầu chỉ hiển thị, không dùng để cảnh báo
-                if abs(head_tilt_degree) > HEAD_NOD_THRESH:
+                # Tư thế "bình thường" của chính người dùng (trung vị 10s gần nhất)
+                tn = time.time()
+                if len(nod_hist) >= 20:
+                    base_pitch = float(np.median([x[0] for x in nod_hist]))
+                    base_ratio = float(np.median([x[1] for x in nod_hist]))
+                    d_pitch = head_tilt_degree - base_pitch
+                    d_ratio = nose_ratio - base_ratio
+                    nodding = abs(d_pitch) > HEAD_NOD_DEG or abs(d_ratio) > HEAD_NOD_RATIO
+                    dtext(f"Góc đầu: {head_tilt_degree:.1f} (lệch {d_pitch:+.1f}) | mũi {d_ratio:+.2f}", 10, 135)
+                else:
+                    nodding = False   # đang học tư thế bình thường (~1 giây đầu)
+                    dtext("Đang hiệu chỉnh tư thế đầu...", 10, 135)
+
+                if nodding:
                     if nod_start is None:
-                        nod_start = time.time()
+                        nod_start = tn
                     if duration(nod_start) >= HEAD_NOD_SECONDS:
-                        alert("BUỒN NGỦ: Gục đầu!", 170)
+                        alert("BUỒN NGỦ: Gục đầu! - Head drooping!", 170)
                 else:
                     nod_start = None
+                    nod_hist.append((head_tilt_degree, nose_ratio, tn))
+                while nod_hist and tn - nod_hist[0][2] > HEAD_BASELINE_SECONDS:
+                    nod_hist.popleft()
 
             # ---------------- 4. LƯỚI ĐIỂM TRANG TRÍ ----------------
             for i, lm in (enumerate(landmarks) if DEBUG else ()):
@@ -420,10 +441,15 @@ try:
             now = time.time()
             if no_face_since is None:
                 no_face_since = now
-            yawn_start = nod_start = None
+            yawn_start = None
+            if nod_start is not None and now - no_face_since < 3.0:
+                if duration(nod_start) >= HEAD_NOD_SECONDS:
+                    alert("BUỒN NGỦ: Gục đầu! - Head drooping!", 170)
+            else:
+                nod_start = None
             if eye_start is not None and now - no_face_since < 3.0:
                 if duration(eye_start) >= EYE_CLOSED_SECONDS:
-                    alert("BUỒN NGỦ: Đang nhắm mắt!", 80)
+                    alert("BUỒN NGỦ: Đang nhắm mắt! - Closing eyes!", 80)
             else:
                 eye_start = None
             dtext("Không thấy khuôn mặt", 10, 20, (255, 165, 0))
